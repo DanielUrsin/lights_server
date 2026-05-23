@@ -1,0 +1,28 @@
+# ESP-IDF build output
+build/
+
+# ESP-IDF generated backups and local config artifacts
+sdkconfig.old
+sdkconfig.ci
+
+# Component Manager downloaded dependencies
+managed_components/
+
+# Compilation databases and cache files generated outside build/
+compile_commands.json
+.cache/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local Python environments/tools
+.venv/
+venv/
+__pycache__/
+*.pyc
