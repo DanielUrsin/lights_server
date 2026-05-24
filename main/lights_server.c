@@ -11,6 +11,8 @@
 #include "esp_err.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "esp_now.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #include "esp_http_server.h"
@@ -19,6 +21,13 @@
 
 #define WIFI_SSID "lights"
 #define WIFI_PASS "123456789"
+#define WIFI_CHANNEL 1
+
+#define ESPNOW_LIGHT_STATE_REQUEST "GET_LIGHT_STATE"
+#define ESPNOW_LIGHT_STATE_RESPONSE_PREFIX "LIGHT_STATE="
+
+#define LIGHT_STATE_NVS_NAMESPACE "lights"
+#define LIGHT_STATE_NVS_KEY "state"
 
 #define BUTTON_GPIO GPIO_NUM_10
 #define LED_GPIO    GPIO_NUM_8
@@ -34,6 +43,56 @@ static volatile int64_t last_press_time_us = 0;
 
 // Queue used to pass button events from ISR → task
 static QueueHandle_t button_queue;
+
+typedef struct {
+    uint8_t mac[ESP_NOW_ETH_ALEN];
+} espnow_light_state_request_t;
+
+// Queue used to pass ESP-NOW requests from the Wi-Fi callback to a task.
+static QueueHandle_t espnow_request_queue;
+
+static esp_err_t save_light_state(uint32_t state)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LIGHT_STATE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(handle, LIGHT_STATE_NVS_KEY, state ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static void load_light_state(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LIGHT_STATE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open light state storage: %s", esp_err_to_name(err));
+        light_state = 0;
+        return;
+    }
+
+    uint8_t stored_state = 0;
+    err = nvs_get_u8(handle, LIGHT_STATE_NVS_KEY, &stored_state);
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        light_state = stored_state ? 1 : 0;
+        ESP_LOGI(TAG, "Loaded persisted light_state=%lu", (unsigned long)light_state);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        light_state = 0;
+        ESP_LOGI(TAG, "No persisted light_state found, defaulting to 0");
+    } else {
+        light_state = 0;
+        ESP_LOGW(TAG, "Failed to load light state: %s", esp_err_to_name(err));
+    }
+}
 
 /*
  * GPIO interrupt handler.
@@ -101,6 +160,13 @@ static void button_task(void *arg)
                  * Toggle the light state
                  */
                 light_state = light_state ? 0 : 1;
+                esp_err_t save_err = save_light_state(light_state);
+                if (save_err != ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "Failed to persist button light_state=%lu: %s",
+                             (unsigned long)light_state,
+                             esp_err_to_name(save_err));
+                }
 
                 last_press_tick = now;
 
@@ -128,6 +194,7 @@ static void button_task(void *arg)
         }
     }
 }
+
 /*
  * HTTP GET /lights
  *
@@ -176,8 +243,41 @@ static esp_err_t set_light_state(httpd_req_t *req)
     int value = atoi(param);
     light_state = value > 0 ? 1 : 0;
 
+    esp_err_t save_err = save_light_state(light_state);
+    if (save_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to persist light state");
+        return save_err;
+    }
+
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req, "OK");
+
+    return ESP_OK;
+}
+
+/*
+ * HTTP GET /mac
+ *
+ * Returns the Wi-Fi SoftAP MAC address as plain text:
+ * "aa:bb:cc:dd:ee:ff"
+ */
+static esp_err_t get_mac_address(httpd_req_t *req)
+{
+    uint8_t mac[6];
+    char response[18];
+
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read MAC address");
+        return err;
+    }
+
+    snprintf(response, sizeof(response), MACSTR, MAC2STR(mac));
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, response);
+
+    ESP_LOGI(TAG, "Responded with mac=%s", response);
 
     return ESP_OK;
 }
@@ -209,12 +309,111 @@ static httpd_handle_t start_http_server(void)
         .user_ctx = NULL,
     };
 
+    // Register GET /mac.
+    httpd_uri_t get_mac_uri = {
+        .uri = "/mac",
+        .method = HTTP_GET,
+        .handler = get_mac_address,
+        .user_ctx = NULL,
+    };
+
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &get_light_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &set_light_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &get_mac_uri));
 
     ESP_LOGI(TAG, "HTTP server started");
 
     return server;
+}
+
+static void espnow_recv_cb(const esp_now_recv_info_t *info,
+                           const uint8_t *data,
+                           int data_len)
+{
+    if (info == NULL || info->src_addr == NULL || data == NULL ||
+        espnow_request_queue == NULL) {
+        return;
+    }
+
+    const size_t request_len = strlen(ESPNOW_LIGHT_STATE_REQUEST);
+    if ((data_len != request_len && data_len != request_len + 1) ||
+        memcmp(data, ESPNOW_LIGHT_STATE_REQUEST, request_len) != 0) {
+        return;
+    }
+
+    espnow_light_state_request_t request = {};
+    memcpy(request.mac, info->src_addr, sizeof(request.mac));
+
+    xQueueSend(espnow_request_queue, &request, 0);
+}
+
+static void espnow_light_state_task(void *arg)
+{
+    espnow_light_state_request_t request;
+
+    while (true) {
+        if (!xQueueReceive(espnow_request_queue, &request, portMAX_DELAY)) {
+            continue;
+        }
+
+        if (!esp_now_is_peer_exist(request.mac)) {
+            esp_now_peer_info_t peer = {};
+            memcpy(peer.peer_addr, request.mac, sizeof(peer.peer_addr));
+            peer.channel = WIFI_CHANNEL;
+            peer.ifidx = WIFI_IF_AP;
+            peer.encrypt = false;
+
+            esp_err_t add_peer_err = esp_now_add_peer(&peer);
+            if (add_peer_err != ESP_OK && add_peer_err != ESP_ERR_ESPNOW_EXIST) {
+                ESP_LOGW(TAG,
+                         "Failed to add ESP-NOW peer " MACSTR ": %s",
+                         MAC2STR(request.mac),
+                         esp_err_to_name(add_peer_err));
+                continue;
+            }
+        }
+
+        char response[16];
+        snprintf(response,
+                 sizeof(response),
+                 ESPNOW_LIGHT_STATE_RESPONSE_PREFIX "%lu",
+                 (unsigned long)light_state);
+
+        esp_err_t send_err = esp_now_send(request.mac,
+                                          (const uint8_t *)response,
+                                          strlen(response));
+        if (send_err == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Sent ESP-NOW light state to " MACSTR ": %s",
+                     MAC2STR(request.mac),
+                     response);
+        } else {
+            ESP_LOGW(TAG,
+                     "Failed to send ESP-NOW light state to " MACSTR ": %s",
+                     MAC2STR(request.mac),
+                     esp_err_to_name(send_err));
+        }
+    }
+}
+
+static void init_espnow(void)
+{
+    espnow_request_queue = xQueueCreate(8, sizeof(espnow_light_state_request_t));
+    assert(espnow_request_queue != NULL);
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    xTaskCreate(
+        espnow_light_state_task,
+        "espnow_light_state",
+        3072,
+        NULL,
+        8,
+        NULL
+    );
+
+    ESP_LOGI(TAG, "ESP-NOW light-state endpoint ready");
 }
 
 /*
@@ -317,7 +516,7 @@ static void init_wifi_ap(void)
 
     // Configure AP behavior.
     wifi_config.ap.ssid_len = strlen(WIFI_SSID);
-    wifi_config.ap.channel = 1;
+    wifi_config.ap.channel = WIFI_CHANNEL;
     wifi_config.ap.max_connection = 8;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
@@ -425,20 +624,24 @@ void app_main(void)
         ESP_ERROR_CHECK(ret);
     }
 
+    // Restore persisted light state before starting hardware and APIs.
+    load_light_state();
+
     // Initialize hardware GPIO first.
     init_gpio();
 
     // Start Wi-Fi SoftAP and wait for it to stabilize.
     init_wifi_ap();
 
+    // Start ESP-NOW request/response API after Wi-Fi is ready.
+    init_espnow();
+
     // Start HTTP API after AP is ready.
     start_http_server();
 
     // Main application loop.
     while (true) {
-        // GPIO8 onboard LED is commonly active-low on many ESP32-C3 boards.
-        // If your LED behaves inverted, remove the "!".
-        gpio_set_level(LED_GPIO, !light_state);
+        gpio_set_level(LED_GPIO, light_state);
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }

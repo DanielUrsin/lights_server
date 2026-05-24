@@ -11,12 +11,35 @@ Connect to the `lights` Wi-Fi network, then use:
 
 ```sh
 curl http://192.168.4.1/lights
+curl http://192.168.4.1/mac
 curl -X POST "http://192.168.4.1/lights?state=1"
 curl -X POST "http://192.168.4.1/lights?state=0"
 ```
 
 `GET /lights` returns `0` or `1`. `POST /lights?state=...` updates the light
-state.
+state and stores it persistently. `GET /mac` returns the server's Wi-Fi SoftAP
+MAC address.
+
+## ESP-NOW API
+
+The SoftAP runs on Wi-Fi channel 1. Send an ESP-NOW message to the server's
+SoftAP MAC address with this payload:
+
+```text
+GET_LIGHT_STATE
+```
+
+The server responds to the sender with:
+
+```text
+LIGHT_STATE=0
+```
+
+or:
+
+```text
+LIGHT_STATE=1
+```
 
 ## Build and Flash
 
